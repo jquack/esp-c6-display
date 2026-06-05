@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+.cache/
+.DS_Store
+
+# WiFi credentials — committed only as wifi_config.example.h
+include/wifi_config.h
