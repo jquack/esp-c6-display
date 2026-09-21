@@ -1,15 +1,22 @@
 #include "api_client.h"
 
 #include <HTTPClient.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <string.h>
 
 ApiClient::ApiClient(const char* url) : _url(url) {}
 
 ApiResult ApiClient::fetch() {
   ApiResult r{false, false, 0};
 
-  WiFiClientSecure client;
-  client.setInsecure();  // skip cert validation; fine for this endpoint
+  // Pick the transport from the URL scheme: TLS (no cert validation) for
+  // https://, plain TCP for http:// so a local fake server works too.
+  const bool useTls = strncmp(_url, "https://", 8) == 0;
+  WiFiClient       plain;
+  WiFiClientSecure tls;
+  if (useTls) tls.setInsecure();  // skip cert validation; fine for this endpoint
+  WiFiClient& client = useTls ? static_cast<WiFiClient&>(tls) : plain;
 
   HTTPClient http;
   http.setTimeout(3000);

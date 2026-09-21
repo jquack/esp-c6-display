@@ -5,13 +5,14 @@
 #include "display_manager.h"
 #include "wifi_manager.h"
 #include "api_client.h"
+#include "plane_gif_data.h"
 
-static constexpr const char* API_URL = "https://phtgc.nl/api/current?simple=1";
+static constexpr const char* API_URL = "http://192.168.10.101:9878/api/current?ac=PH-JMP&simple=1";
 // Poll fast (2s) when there is a value to track; back off (10s) while null so
-// the airplane animation isn't interrupted by the blocking HTTPS call.
+// the plane animation isn't interrupted by the blocking HTTP call.
 static constexpr unsigned long API_INTERVAL_VALUE_MS = 2000;
 static constexpr unsigned long API_INTERVAL_NULL_MS  = 10000;
-static constexpr unsigned long ANIM_FRAME_MS         = 110;  // ~9 fps
+static constexpr unsigned long ANIM_FRAME_MS         = PLANE_FRAME_MS;  // gif frame delay
 
 static DisplayManager display;
 static WifiManager    wifi;
@@ -65,8 +66,8 @@ void loop() {
         animating = false;
       }
     } else {
-      // null or fetch failure → keep crying. Do NOT touch animFrame so the
-      // existing animation continues seamlessly instead of restarting.
+      // null or fetch failure → keep the plane gif running. Do NOT touch
+      // animFrame so the animation continues seamlessly instead of restarting.
       animating = true;
     }
   }
@@ -76,7 +77,7 @@ void loop() {
   static uint32_t      animFrame   = 0;
   if (animating && now - lastFrameMs >= ANIM_FRAME_MS) {
     lastFrameMs = now;
-    display.tickCryingAirplane(animFrame++);
+    display.tickNoDataAnimation(animFrame++);
   }
 
   delay(15);

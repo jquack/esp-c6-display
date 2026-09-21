@@ -1,7 +1,8 @@
 #include "display_manager.h"
+#include "plane_gif_data.h"
 
 #include <Arduino_GFX_Library.h>
-#include <math.h>
+#include <string.h>
 
 // ST7789 1.3" 240x240 — Waveshare ESP32-C6-LCD-1.3
 // Pins inferred from datasheet (these are NOT broken out, used internally).
@@ -145,195 +146,41 @@ void DisplayManager::drawSignalIcon(int x, int y, int bars) {
   }
 }
 
-// HSV (h:0..359, s:0..255, v:0..255) → RGB565
-static uint16_t hsv565(int h, uint8_t s, uint8_t v) {
-  h = ((h % 360) + 360) % 360;
-  uint8_t region    = h / 60;
-  uint8_t remainder = (h - region * 60) * 255 / 60;
-  uint16_t p = (v * (255 - s)) / 255;
-  uint16_t q = (v * (255 - (s * remainder) / 255)) / 255;
-  uint16_t t = (v * (255 - (s * (255 - remainder)) / 255)) / 255;
-  uint8_t r, g, b;
-  switch (region) {
-    case 0: r = v; g = t; b = p; break;
-    case 1: r = q; g = v; b = p; break;
-    case 2: r = p; g = v; b = t; break;
-    case 3: r = p; g = q; b = v; break;
-    case 4: r = t; g = p; b = v; break;
-    default: r = v; g = p; b = q; break;
-  }
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
+// "No data" state: the PH-TGC gif (assets/plane.gif), baked into flash by
+// tools/gif2header.py as an 8-bit palette image. The full frame is drawn once;
+// after that each tick only re-draws the propeller rectangle from a pre-cut
+// patch, so there is no flicker and a tick costs ~7k pixels of SPI traffic
+// instead of ~43k.
+void DisplayManager::tickNoDataAnimation(uint32_t frame) {
+  const int gifX = (SCR_W - PLANE_W) / 2;
+  const int gifY = SCR_H - PLANE_H;  // bottom-aligned; label strip above
+  uint16_t* palette = const_cast<uint16_t*>(PLANE_PALETTE);
 
-void DisplayManager::tickCryingAirplane(uint32_t frame) {
-  // Cessna 182 side view, facing right.
-  // De-flickered design:
-  //   - Static plane drawn ONCE per color cycle (every COLOR_CYCLE_FRAMES).
-  //   - Per-frame updates: only the prop disc and the tear column.
-  //   - No bob (bob would require full per-frame redraw).
+  if (!_animationInitialized) {
+    _animationInitialized = true;
+    _tft->fillRect(0, MAIN_Y, SCR_W, MAIN_H, BG_COLOR);
 
-  const int mainH  = SCR_H - MAIN_Y;
-  const int cx     = SCR_W / 2;
-
-  // Reserve a strip at the top of the main area for the "no data" label.
-  const int labelH    = 30;
-  const int planeAreaY = MAIN_Y + labelH;
-  const int planeAreaH = SCR_H - planeAreaY;
-  const int cy         = planeAreaY + planeAreaH / 2 + 4;
-
-  // Slow color cycle: change hue once per cycle (~6s at 10fps).
-  constexpr uint32_t COLOR_CYCLE_FRAMES = 60;
-  const uint32_t cycleIdx = frame / COLOR_CYCLE_FRAMES;
-  const bool colorChanged = (cycleIdx != _lastColorCycle);
-  const bool fullRedraw   = !_animationInitialized || colorChanged;
-  _animationInitialized = true;
-  _lastColorCycle       = cycleIdx;
-
-  const int hue = (int)(cycleIdx * 30) % 360;
-  uint16_t fuselageC = hsv565(hue,             230, 240);
-  uint16_t wingC     = hsv565(hue + 120,       230, 240);
-  uint16_t tailC     = hsv565(hue +  60,       230, 240);
-  uint16_t accentC   = hsv565(hue + 200,       255, 255);
-  uint16_t propC     = hsv565(hue + 300,       200, 255);
-  const uint16_t windowC = 0x18C3;             // dark glass
-  const uint16_t strutC  = 0xCE59;             // light grey
-  const uint16_t tireC   = 0x0000;             // black
-
-  if (fullRedraw) {
-    _tft->fillRect(0, MAIN_Y, SCR_W, mainH, BG_COLOR);
-
-    // ----- "no data" label at top of main area -----
+    // "no data" label centred in the strip between the top bar and the gif.
     const char* label = "no data";
-    const int textSize = 3;                   // 18x24 px chars
+    const int textSize = 2;  // 12x16 px chars
     const int textW = (int)strlen(label) * 6 * textSize;
     const int textH = 8 * textSize;
-    const int textX = (SCR_W - textW) / 2;
-    const int textY = MAIN_Y + (labelH - textH) / 2;
     _tft->setTextSize(textSize);
-    _tft->setTextColor(accentC, BG_COLOR);
-    _tft->setCursor(textX, textY);
+    _tft->setTextColor(PINK_COLOR, BG_COLOR);
+    _tft->setCursor((SCR_W - textW) / 2, MAIN_Y + (gifY - MAIN_Y - textH) / 2);
     _tft->print(label);
+
+    _tft->drawIndexedBitmap(gifX, gifY, const_cast<uint8_t*>(PLANE_BASE),
+                            palette, PLANE_W, PLANE_H);
+    _lastPatch = 0;  // the base frame already contains patch 0
   }
 
-  // Eye position (used by both static face draw and per-frame tear stream).
-  const int eyeX = cx + 15;
-  const int eyeY = cy - 6;
-
-  if (fullRedraw) {
-  // ----- Tail (back / left) -----
-  // Vertical fin
-  _tft->fillTriangle(cx - 95, cy -  6,
-                     cx - 75, cy - 38,
-                     cx - 65, cy -  6,
-                     tailC);
-  // Horizontal stabilizer (slim)
-  _tft->fillRoundRect(cx - 100, cy - 12, 32, 6, 2, tailC);
-
-  // ----- Fuselage -----
-  // Tail boom (slim left half)
-  _tft->fillRoundRect(cx - 85, cy - 6, 70, 16, 6, fuselageC);
-  // Cabin (taller, where pilot sits)
-  _tft->fillRoundRect(cx - 25, cy - 14, 75, 28, 10, fuselageC);
-  // Engine cowling (right end)
-  _tft->fillRoundRect(cx + 45, cy - 12, 35, 26, 8, fuselageC);
-
-  // ----- High wing (above fuselage, full span) -----
-  _tft->fillRoundRect(cx - 105, cy - 26, 200, 9, 3, wingC);
-  // Pitot/wing tip hints
-  _tft->drawPixel(cx + 94,  cy - 22, accentC);
-  _tft->drawPixel(cx - 104, cy - 22, accentC);
-
-  // Wing strut (diagonal V from wing bottom to fuselage bottom)
-  for (int dx = -1; dx <= 1; dx++) {
-    _tft->drawLine(cx + 12 + dx, cy - 17,
-                   cx -  8 + dx, cy + 12, strutC);
-  }
-
-  // ----- Cockpit window (where the eye is) -----
-  // Slanted trapezoid following Cessna's windshield rake
-  _tft->fillTriangle(cx - 18, cy - 13, cx + 30, cy - 13, cx + 36, cy - 4, windowC);
-  _tft->fillRect    (cx - 18, cy - 13, 54, 10, windowC);
-  // window frame highlight
-  _tft->drawLine(cx + 30, cy - 13, cx + 36, cy - 4, accentC);
-
-  // ----- Sad pilot eye inside cockpit -----
-  _tft->fillCircle(eyeX, eyeY, 6, 0xFFFF);
-  _tft->fillCircle(eyeX - 2, eyeY + 2, 3, 0x0000);  // pupil drooped (sad)
-  _tft->drawPixel(eyeX - 3, eyeY, 0xFFFF);          // catchlight
-
-  // Sad eyebrow (red, slanted)
-  _tft->drawLine(eyeX - 8, eyeY - 8, eyeX + 6, eyeY - 5, RED_COLOR);
-  _tft->drawLine(eyeX - 8, eyeY - 9, eyeX + 6, eyeY - 6, RED_COLOR);
-
-  // Frown on the cowling/cheek below window
-  int mx = eyeX - 4;
-  int my = cy + 6;
-  _tft->drawLine(mx,     my + 2, mx + 5,  my,     RED_COLOR);
-  _tft->drawLine(mx + 5, my,     mx + 12, my,     RED_COLOR);
-  _tft->drawLine(mx + 12,my,     mx + 17, my + 2, RED_COLOR);
-
-  // ----- Tricycle landing gear (static) -----
-  {
-    int gearTopY  = cy + 14;
-    int wheelY    = cy + 36;
-    int mainX = cx + 5;
-    for (int dx = -1; dx <= 0; dx++) {
-      _tft->drawLine(mainX + dx, gearTopY, mainX + dx, wheelY - 4, strutC);
-    }
-    _tft->fillCircle(mainX, wheelY, 5, tireC);
-    _tft->drawCircle(mainX, wheelY, 5, accentC);
-    int noseX = cx + 56;
-    for (int dx = -1; dx <= 0; dx++) {
-      _tft->drawLine(noseX + dx, gearTopY, noseX + dx, wheelY - 4, strutC);
-    }
-    _tft->fillCircle(noseX, wheelY, 5, tireC);
-    _tft->drawCircle(noseX, wheelY, 5, accentC);
-  }
-  }  // end if (fullRedraw)
-
-  // ----- Propeller spinning on the nose (per-frame) -----
-  int propX = cx + 82;
-  int propY = cy + 1;
-  // Clear prop disc — looks like motion-blurred prop background.
-  _tft->fillCircle(propX, propY, 19, BG_COLOR);
-  _tft->fillCircle(propX, propY, 3, accentC);       // hub
-  // Two-blade prop, rotating through 4 phases
-  switch ((int)(frame % 4)) {
-    case 0:
-      _tft->drawLine(propX, propY - 18, propX, propY + 18, propC);
-      _tft->drawLine(propX + 1, propY - 18, propX + 1, propY + 18, propC);
-      break;
-    case 1:
-      _tft->drawLine(propX - 13, propY - 13, propX + 13, propY + 13, propC);
-      _tft->drawLine(propX - 12, propY - 14, propX + 14, propY + 12, propC);
-      break;
-    case 2:
-      _tft->drawLine(propX - 18, propY, propX + 18, propY, propC);
-      _tft->drawLine(propX - 18, propY + 1, propX + 18, propY + 1, propC);
-      break;
-    case 3:
-      _tft->drawLine(propX - 13, propY + 13, propX + 13, propY - 13, propC);
-      _tft->drawLine(propX - 14, propY + 12, propX + 12, propY - 14, propC);
-      break;
-  }
-
-  // ----- Tears falling from cockpit (per-frame) -----
-  const uint16_t tearC    = 0x5DFF;
-  const uint16_t tearHigh = 0x07FF;
-  const int tearOriginX = eyeX - 3;
-  const int tearOriginY = cy + 12;
-  // Clear the vertical strip the tears occupy so old tear pixels disappear.
-  _tft->fillRect(tearOriginX - 6, tearOriginY, 14, SCR_H - tearOriginY, BG_COLOR);
-  for (int i = 0; i < 5; i++) {
-    int span  = 80;
-    int phase = (frame * 4 + i * 16) % span;
-    int tx    = tearOriginX + ((i & 1) ? 3 : -3);
-    int ty    = tearOriginY + phase * 2;
-    if (ty > SCR_H - 5) continue;
-    _tft->fillCircle(tx, ty,     2, tearC);
-    _tft->fillCircle(tx, ty - 3, 1, tearC);
-    _tft->drawPixel(tx - 1, ty - 1, tearHigh);
-  }
+  const int patch = PLANE_SEQ[frame % PLANE_SEQ_LEN];
+  if (patch == _lastPatch) return;
+  _lastPatch = patch;
+  _tft->drawIndexedBitmap(gifX + PLANE_PATCH_X, gifY + PLANE_PATCH_Y,
+                          const_cast<uint8_t*>(PLANE_PATCH[patch]), palette,
+                          PLANE_PATCH_W, PLANE_PATCH_H);
 }
 
 int DisplayManager::rssiToBars(int rssi) {
